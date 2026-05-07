@@ -810,8 +810,7 @@ class ResponseFormatter:
 """
 
         if result.warnings:
-            text += "
-⚠️ **Caveats**: " + "; ".join(result.warnings)
+            text += "\n⚠️ **Caveats**: " + "; ".join(result.warnings)
 
         return text
 
@@ -833,13 +832,10 @@ class ResponseFormatter:
 
         for i, a in enumerate(r['anomalies'][:5], 1):
             cat_text = f" ({a['category']})" if a['category'] else ""
-            text += f"
-{i}. Value **{a['value']}**{cat_text} — Confidence: {a['confidence']} (methods: {', '.join(a['methods'])})"
+            text += f"\n{i}. Value **{a['value']}**{cat_text} — Confidence: {a['confidence']} (methods: {', '.join(a['methods'])})"
 
         if len(r['anomalies']) > 5:
-            text += f"
-
-... and {len(r['anomalies']) - 5} more"
+            text += f"\n\n... and {len(r['anomalies']) - 5} more"
 
         return text
 
@@ -856,9 +852,8 @@ class ResponseFormatter:
 📅 **Next Periods**:
 """
 
-        for i, (f, l, u) in enumerate(zip(r['forecast_values'], r['ci_lower'], r['ci_upper']), 1):
-            text += f"
-• Period +{i}: **{f}** (range: {l} to {u})"
+        for i, (f_val, l, u) in enumerate(zip(r['forecast_values'], r['ci_lower'], r['ci_upper']), 1):
+            text += f"\n• Period +{i}: **{f_val}** (range: {l} to {u})"
 
         text += f"""
 
@@ -1105,15 +1100,14 @@ if "Ask" in mode:
                     result = reg.correlation_matrix()
                     if result.valid:
                         r = result.result
-                        text = f"**Correlation Analysis**
+                        text = f"""**Correlation Analysis**
 
 Found **{r['n_metrics']}** metrics with **{len(r['strong_relationships'])}** strong relationships (|r| > 0.5):
 
-"
+"""
                         for rel in r['strong_relationships'][:5]:
                             sig = "✅" if rel['significant'] else "❌"
-                            text += f"• {rel['var1']} ↔ {rel['var2']}: {rel['correlation']} {sig} (n={rel['n_obs']})
-"
+                            text += f"• {rel['var1']} ↔ {rel['var2']}: {rel['correlation']} {sig} (n={rel['n_obs']})\n"
                     else:
                         text = f"❌ {result.warnings[0] if result.warnings else 'Error'}"
 
@@ -1131,15 +1125,14 @@ Found **{r['n_metrics']}** metrics with **{len(r['strong_relationships'])}** str
                         result = reg.group_aggregate(metric, cat, agg)
                         if result.valid:
                             r = result.result
-                            text = f"**{agg.title()} of {metric} by {cat}**
+                            text = f"""**{agg.title()} of {metric} by {cat}**
 
 Groups found: {r['n_groups']}
 
 Top values:
-"
+"""
                             for v in r['values'][:5]:
-                                text += f"• {v[r['group_by']]}: **{v[f'{agg}_{metric}']:.2f}**
-"
+                                text += f"• {v[r['group_by']]}: **{v[f'{agg}_{metric}']:.2f}**\n"
                         else:
                             text = f"❌ {result.warnings[0] if result.warnings else 'Error'}"
                     else:
