@@ -1,6 +1,6 @@
 """
 AxiLattice Pro — Production-Grade Insight Engine
-"Works on Any Data" — Full Insight Suite
+Multi-Dimensional Support | "Works on Any Data"
 """
 
 import streamlit as st
@@ -19,7 +19,6 @@ from scipy.stats import kendalltau, spearmanr, chi2_contingency, f_oneway
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -70,7 +69,7 @@ class VoiceManager:
 
 
 # ============================================================
-# CUBE ARCHITECTURE
+# CUBE ARCHITECTURE — MULTI-DIMENSIONAL
 # ============================================================
 
 @dataclass
@@ -92,9 +91,10 @@ class Cuboid:
     rows: int
 
 class DataCube:
-    def __init__(self, df, profiler):
+    def __init__(self, df, profiler, max_dims=3):
         self.df = df
         self.prof = profiler
+        self.max_dims = max_dims
         self.dims: List[CubeDim] = []
         self.meas: List[CubeMeas] = []
         self.cuboids: Dict[str, Cuboid] = {}
@@ -107,22 +107,23 @@ class DataCube:
         if self.prof.temp_col:
             self.dims.append(CubeDim("Time", self.prof.temp_col, self.df[self.prof.temp_col].nunique()))
         for c in self.prof.num_cols:
-            self.meas.append(CubeMeas(c, c, ["sum","mean","count","min","max","std"]))
+            self.meas.append(CubeMeas(c, c, ["sum","avg","cnt","min","max","std"]))
 
     def _precompute(self):
+        from itertools import combinations
         names = [d.name for d in self.dims]
-        for d in names:
-            self._make((d,))
-        for i, a in enumerate(names):
-            for b in names[i+1:]:
-                c1 = next(x.card for x in self.dims if x.name == a)
-                c2 = next(x.card for x in self.dims if x.name == b)
-                if c1 * c2 < 1e5:
-                    self._make((a, b))
+        n = len(names)
+        for r in range(1, min(self.max_dims+1, n+1)):
+            for combo in combinations(names, r):
+                cards = [next(x.card for x in self.dims if x.name == nm) for nm in combo]
+                if np.prod(cards) < 2e5:
+                    self._make(combo)
         self._make(())
 
     def _make(self, dims: Tuple):
-        key = "_".join(dims) if dims else "total"
+        key = "_".join(sorted(dims)) if dims else "total"
+        if key in self.cuboids:
+            return
         cols = [next(d.col for d in self.dims if d.name == n) for n in dims]
         ad = {}
         for m in self.meas:
@@ -161,12 +162,11 @@ class DataCube:
 
     def info(self):
         n = len(self.dims)
-        total = max(1, n*(n-1)//2 + n + 1)
         return {
             "dims": n, "meas": len(self.meas),
             "cuboids": len(self.cuboids),
             "rows": sum(c.rows for c in self.cuboids.values()),
-            "coverage": len(self.cuboids)/total
+            "max_precompute_dims": self.max_dims
         }
 
 
@@ -292,7 +292,7 @@ class DataProfiler:
 
 
 # ============================================================
-# INSIGHT ENGINE — ALL TYPES
+# INSIGHT ENGINE — ALL TYPES + MULTI-DIMENSIONAL
 # ============================================================
 
 class InsightResult:
@@ -314,6 +314,8 @@ class InsightEngine:
             self.df['_dt'] = self.dt
 
     def _find(self, name, pool):
+        if not name:
+            return None
         nl = name.lower().replace(' ','').replace('_','')
         for c in pool:
             cl = c.lower().replace(' ','').replace('_','')
@@ -326,6 +328,17 @@ class InsightEngine:
 
     def _find_cat(self, name):
         return self._find(name, self.prof.cat_cols)
+
+    def _find_all_cats(self, query_text):
+        found = []
+        ql = query_text.lower()
+        for c in self.prof.cat_cols:
+            patterns = [c.lower(), c.lower().replace('_',' '), c.lower().replace('_','')]
+            for p in patterns:
+                if p in ql and c not in found:
+                    found.append(c)
+                    break
+        return found
 
     # 1. TREND
     def trend(self, metric):
@@ -353,25 +366,45 @@ class InsightEngine:
             f"**Trend: {col}**\n\n📈 {dir.upper()} | τ={r['tau']} (p={r['p']})\n📉 Slope: {r['slope']}/period\n💰 Change: {r['chg']}%",
             fig, d, meta={"type":"trend","result":r})
 
-    # 2. AGGREGATE
-    def aggregate(self, metric, by, agg="mean"):
+    # 2. AGGREGATE — MULTI-DIMENSIONAL
+    def aggregate(self, metric, by_dims, agg="sum"):
         mc = self._find_num(metric)
-        bc = self._find_cat(by)
-        if not mc or not bc:
-            return InsightResult(False, "Columns not found")
-        # Cube
+        if not mc:
+            return InsightResult(False, f"Metric '{metric}' not found")
+        if isinstance(by_dims, str):
+            by_dims = [by_dims]
+        bc = []
+        for b in by_dims:
+            found = self._find_cat(b)
+            if found:
+                bc.append(found)
+        if not bc:
+            return InsightResult(False, f"No valid dimensions found in {by_dims}")
         try:
-            rdf = self.cube.query([bc], [mc], [agg])
+            rdf = self.cube.query(bc, [mc], [agg])
             src = "cube"
-        except:
+        except Exception as e:
             rdf = self.df.groupby(bc)[mc].agg(agg).reset_index()
-            rdf.columns = [bc, f"{agg}_{mc}"]
             src = "raw"
         vals = rdf.to_dict('records')
-        fig = px.bar(rdf, x=bc, y=rdf.columns[1], title=f"{agg.title()} {mc} by {bc}")
-        return InsightResult(True,
-            f"**{agg.title()} {mc} by {bc}**\n\nGroups: {len(rdf)} ({src})\n" + "\n".join([f"• {v[bc]}: **{v[rdf.columns[1]]:.2f}**" for v in vals[:5]]),
-            fig, rdf, meta={"type":"aggregate","result":{"agg":agg,"by":bc,"metric":mc,"n":len(rdf),"src":src}})
+        dim_str = " × ".join(bc)
+        txt = f"**{agg.title()} {mc} by {dim_str}**\n\nGroups: {len(rdf)} ({src})\n"
+        for v in vals[:10]:
+            dim_vals = " | ".join([str(v[b]) for b in bc])
+            measure_col = f"{mc}_{agg}" if f"{mc}_{agg}" in rdf.columns else mc
+            txt += f"\n• {dim_vals}: **{v[measure_col]:.2f}**"
+        if len(vals) > 10:
+            txt += f"\n\n... and {len(vals)-10} more groups"
+        if len(bc) == 1:
+            fig = px.bar(rdf, x=bc[0], y=rdf.columns[-1], title=f"{agg.title()} {mc} by {bc[0]}")
+        elif len(bc) == 2:
+            fig = px.density_heatmap(rdf, x=bc[0], y=bc[1], z=rdf.columns[-1],
+                                     title=f"{agg.title()} {mc} by {bc[0]} × {bc[1]}",
+                                     color_continuous_scale="Blues")
+        else:
+            fig = None
+        return InsightResult(True, txt, fig, rdf,
+            meta={"type":"aggregate","result":{"agg":agg,"by":bc,"metric":mc,"n":len(rdf),"src":src}})
 
     # 3. DISTRIBUTION
     def distribution(self, metric):
@@ -416,7 +449,6 @@ class InsightEngine:
             return InsightResult(False, "Need 2+ metrics")
         d = self.df[self.prof.num_cols].corr()
         fig = px.imshow(d, text_auto=".2f", aspect="auto", title="Correlation Matrix")
-        # Find strongest
         mask = np.triu(np.ones_like(d, dtype=bool), k=1)
         corr_vals = d.where(mask).stack().sort_values(key=abs, ascending=False)
         top = corr_vals.head(3)
@@ -442,7 +474,7 @@ class InsightEngine:
             f"**Anomaly Detection: {col}**\n\n🔴 Anomalies: {n_anom} ({n_anom/len(d)*100:.1f}%)\n✅ Normal: {len(d)-n_anom}",
             fig, d, meta={"type":"anomaly","result":{"anomalies":n_anom}})
 
-    # 7. SEGMENTATION (K-Means)
+    # 7. SEGMENTATION
     def segment(self, metrics, n=3):
         cols = [self._find_num(m) for m in metrics]
         cols = [c for c in cols if c]
@@ -511,7 +543,7 @@ class InsightEngine:
             f"**Pareto: {mc} by {bc}**\n\n📊 Top {n80} of {len(d)} groups = 80% of total\n🏆 Leader: {d.iloc[0][bc]} ({d.iloc[0][mc]:.2f})",
             fig, d, meta={"type":"pareto","result":{"n80":n80,"total":len(d)}})
 
-    # 10. FORECAST (Simple)
+    # 10. FORECAST
     def forecast(self, metric, periods=6):
         col = self._find_num(metric)
         if not col:
@@ -521,7 +553,6 @@ class InsightEngine:
         d = self.df[[col,'_dt']].dropna().sort_values('_dt')
         if len(d) < 6:
             return InsightResult(False, "Need 6+ points")
-        # Simple exponential smoothing
         alpha = 0.3
         fcast = [d[col].iloc[0]]
         for i in range(1, len(d)):
@@ -530,7 +561,7 @@ class InsightEngine:
         freq = (d['_dt'].iloc[-1] - d['_dt'].iloc[-2]).days if len(d) > 1 else 30
         future_dates = [last_date + timedelta(days=freq*(i+1)) for i in range(periods)]
         last_level = fcast[-1]
-        future_vals = [last_level] * periods  # flat forecast for simplicity
+        future_vals = [last_level] * periods
         hist = d.copy()
         hist['type'] = 'Historical'
         fut = pd.DataFrame({'_dt': future_dates, col: future_vals, 'type': 'Forecast'})
@@ -539,6 +570,7 @@ class InsightEngine:
         return InsightResult(True,
             f"**Forecast: {col}**\n\n📈 Next {periods} periods: ~{last_level:.2f} each\n⚠️ Simple model — use with caution",
             fig, combined, meta={"type":"forecast","result":{"next":last_level,"periods":periods}})
+
 
     # 11. TOP-N
     def top_n(self, metric, by, n=5, agg="sum"):
@@ -617,7 +649,7 @@ class InsightEngine:
             f"**Variance: {mc} by {bc}**\n\n📊 F={f_stat:.2f} (p={p:.4f})\n{'✅ Significant diff' if p < 0.05 else '❌ No significant diff'}",
             fig, d, meta={"type":"variance","result":{"f":f_stat,"p":p}})
 
-    # 16. CROSS-TAB / CHI-SQUARE
+    # 16. CROSS-TAB
     def crosstab(self, cat1, cat2):
         c1 = self._find_cat(cat1)
         c2 = self._find_cat(cat2)
@@ -670,7 +702,7 @@ class InsightEngine:
             figs.append(fig)
         return InsightResult(True, txt, figs[0] if figs else None, None, meta={"type":"profile"})
 
-    # 20. AUTO-INSIGHTS (runs all applicable)
+    # 20. AUTO-INSIGHTS
     def auto_insights(self):
         insights = []
         if self.prof.num_cols and self.dt is not None:
@@ -678,7 +710,7 @@ class InsightEngine:
         if len(self.prof.num_cols) >= 2:
             insights.append(self.correlation(self.prof.num_cols[0], self.prof.num_cols[1]))
         if self.prof.num_cols and self.prof.cat_cols:
-            insights.append(self.aggregate(self.prof.num_cols[0], self.prof.cat_cols[0]))
+            insights.append(self.aggregate(self.prof.num_cols[0], [self.prof.cat_cols[0]]))
             insights.append(self.pareto(self.prof.num_cols[0], self.prof.cat_cols[0]))
         if len(self.prof.num_cols) >= 2:
             insights.append(self.segment(self.prof.num_cols[:3], 3))
@@ -687,9 +719,57 @@ class InsightEngine:
             insights.append(self.anomaly(self.prof.num_cols[0]))
         return insights
 
+    # 21. MULTI-DIMENSIONAL SLICE (NEW)
+    def slice_data(self, metric, dimensions, filters=None, agg="sum"):
+        mc = self._find_num(metric)
+        if not mc:
+            return InsightResult(False, f"Metric '{metric}' not found")
+        if isinstance(dimensions, str):
+            dimensions = [dimensions]
+        resolved_dims = []
+        for d in dimensions:
+            found = self._find_cat(d)
+            if found:
+                resolved_dims.append(found)
+        if not resolved_dims:
+            return InsightResult(False, f"No valid dimensions in {dimensions}")
+        df_work = self.df.copy()
+        if filters:
+            for col, val in filters.items():
+                found_col = self._find_cat(col) or self._find_num(col)
+                if found_col and found_col in df_work.columns:
+                    df_work = df_work[df_work[found_col] == val]
+        try:
+            rdf = df_work.groupby(resolved_dims)[mc].agg(agg).reset_index()
+        except Exception as e:
+            return InsightResult(False, f"Aggregation failed: {e}")
+        dim_str = " × ".join(resolved_dims)
+        txt = f"**{agg.title()} {mc} by {dim_str}**\n\n"
+        if filters:
+            filt_str = " | ".join([f"{k}={v}" for k, v in filters.items()])
+            txt += f"🔍 Filtered: {filt_str}\n\n"
+        txt += f"Groups: {len(rdf)}\n"
+        for _, v in rdf.head(15).iterrows():
+            dim_vals = " | ".join([str(v[d]) for d in resolved_dims])
+            txt += f"\n• {dim_vals}: **{v[mc]:.2f}**"
+        if len(rdf) > 15:
+            txt += f"\n\n... and {len(rdf)-15} more"
+        if len(resolved_dims) == 1:
+            fig = px.bar(rdf, x=resolved_dims[0], y=mc, title=f"{agg.title()} {mc} by {resolved_dims[0]}")
+        elif len(resolved_dims) == 2:
+            fig = px.density_heatmap(rdf, x=resolved_dims[0], y=resolved_dims[1], z=mc,
+                                     title=f"{agg.title()} {mc} by {dim_str}", color_continuous_scale="Blues")
+        elif len(resolved_dims) == 3:
+            fig = px.bar(rdf, x=resolved_dims[0], y=mc, color=resolved_dims[1], facet_col=resolved_dims[2],
+                        title=f"{agg.title()} {mc} by {dim_str}")
+        else:
+            fig = None
+        return InsightResult(True, txt, fig, rdf,
+            meta={"type":"slice","result":{"agg":agg,"by":resolved_dims,"metric":mc,"n":len(rdf),"filters":filters}})
+
 
 # ============================================================
-# QUERY RESOLVER
+# QUERY RESOLVER — MULTI-DIMENSIONAL
 # ============================================================
 
 class QueryResolver:
@@ -730,7 +810,8 @@ class QueryResolver:
             "ranking": ['rank','ranking','ordered','sorted'],
             "outliers": ['outlier table','outlier list','extreme values'],
             "profile": ['profile','overview','summary','describe'],
-            "auto": ['auto','all insights','full report','everything']
+            "auto": ['auto','all insights','full report','everything'],
+            "slice": ['sales for','by region','by product','for a','in month','drill down']
         }
         for name, words in patterns.items():
             if any(w in q for w in words):
@@ -739,30 +820,45 @@ class QueryResolver:
 
     def _entities(self, q):
         e = {}
+        ql = q.lower()
+        # Find metric
         for c in self.prof.num_cols:
             for p in [c.lower(), c.lower().replace('_',' ')]:
-                if p in q:
+                if p in ql:
                     e['metric'] = c
                     break
+        # Find ALL categories (multi-dimensional)
+        e['categories'] = []
         for c in self.prof.cat_cols:
-            if c.lower() in q or c.lower().replace('_',' ') in q:
-                e['category'] = c
-                break
+            patterns = [c.lower(), c.lower().replace('_',' '), c.lower().replace('_','')]
+            for p in patterns:
+                if p in ql and c not in e['categories']:
+                    e['categories'].append(c)
+                    break
+        if e['categories']:
+            e['category'] = e['categories'][0]
+        # Second metric
         for c in self.prof.num_cols:
-            if c != e.get('metric') and (c.lower() in q or c.lower().replace('_',' ') in q):
+            if c != e.get('metric') and (c.lower() in ql or c.lower().replace('_',' ') in ql):
                 e['metric2'] = c
                 break
-        if 'sum' in q or 'total' in q:
+        # Aggregation
+        if 'sum' in ql or 'total' in ql:
             e['agg'] = 'sum'
-        elif 'avg' in q or 'average' in q or 'mean' in q:
+        elif 'avg' in ql or 'average' in ql or 'mean' in ql:
             e['agg'] = 'mean'
-        elif 'count' in q:
+        elif 'count' in ql:
             e['agg'] = 'count'
         else:
-            e['agg'] = 'mean'
-        # Extract numbers for top-n
-        import re as re_mod
-        nums = re_mod.findall(r'\btop\s+(\d+)\b', q)
+            e['agg'] = 'sum'
+        # Extract filter values
+        e['filters'] = {}
+        for c in self.prof.cat_cols:
+            pattern = rf"(?:for|in|where)\s+{re.escape(c.lower())}\s+(\w+)"
+            match = re.search(pattern, ql)
+            if match:
+                e['filters'][c] = match.group(1)
+        nums = re.findall(r'\btop\s+(\d+)\b', ql)
         if nums:
             e['n'] = int(nums[0])
         return e
@@ -809,11 +905,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # State
-for k in ['prof','cube','engine','resolver','df','voice','obs']:
+for k in ['prof','cube','engine','resolver','chat','df','voice','obs']:
     if k not in st.session_state:
         st.session_state[k] = None
-if 'chat' not in st.session_state or st.session_state.chat is None:
-    st.session_state.chat = []
 if st.session_state.voice is None:
     st.session_state.voice = VoiceManager()
 if st.session_state.obs is None:
@@ -822,7 +916,7 @@ if st.session_state.obs is None:
 # Sidebar
 with st.sidebar:
     st.markdown('<p class="hdr">🧠 AxiLattice Pro</p>', unsafe_allow_html=True)
-    st.caption("Production Insight Engine | 20 Insight Types")
+    st.caption("Multi-Dimensional | 21 Insight Types | Slice & Dice")
 
     up = st.file_uploader("📁 Upload", type=['csv','xlsx','parquet'])
     if up:
@@ -841,7 +935,7 @@ with st.sidebar:
                 df = pd.read_excel(up, engine='openpyxl')
             st.session_state.df = df
             st.session_state.prof = DataProfiler(df)
-            st.session_state.cube = DataCube(df, st.session_state.prof)
+            st.session_state.cube = DataCube(df, st.session_state.prof, max_dims=3)
             st.session_state.engine = InsightEngine(st.session_state.prof, st.session_state.cube)
             st.session_state.resolver = QueryResolver(st.session_state.prof)
             st.success(f"✅ {len(df):,} × {len(df.columns)}")
@@ -854,13 +948,14 @@ with st.sidebar:
             st.error(f"❌ {e}")
 
     if st.session_state.prof:
-        mode = st.radio("Mode", ["🎙️ Ask","📊 Auto","🔍 Explore","📈 Observe"])
+        mode = st.radio("Mode", ["🎙️ Ask","📊 Auto","🔍 Explore","📈 Observe","🧊 Slice"])
     else:
         st.info("Upload data")
 
+
 # Main
 if not st.session_state.prof:
-    st.markdown("## 👋 AxiLattice Pro\n\n**20 Production Insight Types:**\n- Trend, Aggregate, Distribution, Correlation, Corr-Matrix\n- Anomaly, Segmentation, Change Point, Pareto, Forecast\n- Top-N, Composition, Growth, Seasonality, Variance\n- Cross-tab, Ranking, Outlier Table, Profile, Auto-Insights")
+    st.markdown("## 👋 AxiLattice Pro\n\n**Multi-Dimensional Insight Engine**\n\nAsk things like:\n- *'Sales by region by product by month'*\n- *'Revenue for region North in January'*\n- *'Total profit breakdown by category and subcategory'*\n- *'Average units by store by quarter'*\n\n**21 Insight Types:** Trend, Aggregate (multi-dim), Distribution, Correlation, Corr-Matrix, Anomaly, Segmentation, Change Point, Pareto, Forecast, Top-N, Composition, Growth, Seasonality, Variance, Cross-tab, Ranking, Outlier Table, Profile, Auto-Insights, Slice")
     st.stop()
 
 prof = st.session_state.prof
@@ -897,13 +992,15 @@ if "Ask" in mode:
             sug.append(f"Distribution of {prof.num_cols[0]}")
             sug.append(f"Anomaly in {prof.num_cols[0]}")
         if prof.num_cols and prof.cat_cols:
+            if len(prof.cat_cols) >= 2:
+                sug.append(f"{prof.num_cols[0]} by {prof.cat_cols[0]} by {prof.cat_cols[1]}")
             sug.append(f"Average {prof.num_cols[0]} by {prof.cat_cols[0]}")
             sug.append(f"Pareto {prof.num_cols[0]} by {prof.cat_cols[0]}")
         if len(prof.num_cols) >= 2:
             sug.append(f"Correlation {prof.num_cols[0]} vs {prof.num_cols[1]}")
         sug.extend(["Auto insights","Profile summary"])
         for s in sug:
-            if st.button(s, key=f"q_{s[:15]}"):
+            if st.button(s, key=f"q_{s[:20]}"):
                 st.session_state.pending = s
 
     with c2:
@@ -928,24 +1025,29 @@ if "Ask" in mode:
             t0 = time.time()
             st.session_state.chat.append({"role":"u","text":q})
 
-            if res is None:
-                res = QueryResolver(st.session_state.prof)
-                st.session_state.resolver = res
-
             with st.spinner("Analyzing..."):
                 r = res.resolve(q)
                 intent = r['intent']['type']
                 e = r['ent']
                 result = None
 
-                # Route to engine
                 if intent == "trend":
                     m = e.get('metric', prof.num_cols[0] if prof.num_cols else None)
                     result = eng.trend(m) if m else InsightResult(False, "No metric")
                 elif intent == "aggregate":
                     m = e.get('metric', prof.num_cols[0] if prof.num_cols else None)
-                    c = e.get('category', prof.cat_cols[0] if prof.cat_cols else None)
-                    result = eng.aggregate(m, c, e.get('agg','mean')) if m and c else InsightResult(False, "Need metric+category")
+                    cats = e.get('categories', [])
+                    if not cats and e.get('category'):
+                        cats = [e['category']]
+                    if not cats and prof.cat_cols:
+                        cats = [prof.cat_cols[0]]
+                    result = eng.aggregate(m, cats, e.get('agg','sum')) if m else InsightResult(False, "No metric")
+                elif intent == "slice":
+                    m = e.get('metric', prof.num_cols[0] if prof.num_cols else None)
+                    cats = e.get('categories', [])
+                    if not cats and e.get('category'):
+                        cats = [e['category']]
+                    result = eng.slice_data(m, cats, e.get('filters'), e.get('agg','sum')) if m else InsightResult(False, "No metric")
                 elif intent == "distribution":
                     m = e.get('metric', prof.num_cols[0] if prof.num_cols else None)
                     result = eng.distribution(m) if m else InsightResult(False, "No metric")
@@ -1010,14 +1112,20 @@ if "Ask" in mode:
                     results = eng.auto_insights()
                     for ri in results:
                         st.session_state.chat.append({
-                            "role":"a","text":ri.text,"viz":ri.viz,"data":ri.data,"tts":re.sub(r'[\*#]','',ri.text).replace('\n',' ')[:500]
+                            "role":"a","text":ri.text,"viz":ri.viz,"data":ri.data,
+                            "tts":re.sub(r'[\*#]','',ri.text).replace('\n',' ')[:500]
                         })
                     ms = int((time.time()-t0)*1000)
                     obs.log(q, r['intent'], "auto", None, ms)
                     st.rerun()
                     st.stop()
                 else:
-                    result = InsightResult(False, f"🤔 Try: 'Trend in {prof.num_cols[0] if prof.num_cols else 'sales'}' or 'Auto insights'")
+                    m = e.get('metric', prof.num_cols[0] if prof.num_cols else None)
+                    cats = e.get('categories', [])
+                    if m and cats:
+                        result = eng.slice_data(m, cats, e.get('filters'), e.get('agg','sum'))
+                    else:
+                        result = InsightResult(False, f"🤔 Try: 'Sales by region by product' or 'Auto insights'")
 
                 ms = int((time.time()-t0)*1000)
                 iid = obs.log(q, r['intent'], intent, result, ms)
@@ -1028,6 +1136,7 @@ if "Ask" in mode:
                     "data":result.data if result else None,"tts":tts,"id":iid
                 })
                 st.rerun()
+
 
 elif "Auto" in mode:
     st.markdown('<p class="hdr">📊 Auto-Report</p>', unsafe_allow_html=True)
@@ -1073,5 +1182,36 @@ elif "Observe" in mode:
             with st.expander(f"{lg['q'][:50]}... ({lg['ms']}ms)"):
                 st.json(lg)
 
+elif "Slice" in mode:
+    st.markdown('<p class="hdr">🧊 Multi-Dimensional Slice</p>', unsafe_allow_html=True)
+    st.caption("Drag-and-drop slice & dice interface")
+
+    m = st.selectbox("Metric", prof.num_cols) if prof.num_cols else None
+    dims = st.multiselect("Dimensions", prof.cat_cols, default=prof.cat_cols[:min(2,len(prof.cat_cols))])
+    agg = st.selectbox("Aggregation", ["sum","avg","count","min","max"], index=0)
+
+    st.subheader("Filters")
+    filters = {}
+    cols = st.columns(min(3, len(prof.cat_cols)))
+    for i, c in enumerate(prof.cat_cols[:3]):
+        with cols[i % 3]:
+            vals = ["All"] + sorted(st.session_state.df[c].dropna().unique().tolist())
+            sel = st.selectbox(f"{c}", vals, index=0)
+            if sel != "All":
+                filters[c] = sel
+
+    if m and dims and st.button("🔍 Slice"):
+        r = eng.slice_data(m, dims, filters if filters else None, agg)
+        if r.valid:
+            st.markdown(r.text)
+            if r.viz:
+                st.plotly_chart(r.viz, use_container_width=True)
+            if r.data is not None:
+                st.dataframe(r.data, use_container_width=True)
+                csv = r.data.to_csv(index=False)
+                st.download_button("📥 Download CSV", csv, f"slice_{m}.csv", "text/csv")
+        else:
+            st.error(r.warnings[0] if r.warnings else "Error")
+
 st.divider()
-st.caption("AxiLattice Pro | 20 Insight Types | Production-Ready")
+st.caption("AxiLattice Pro | Multi-Dimensional | 21 Insight Types | Production-Ready")
